@@ -1,0 +1,254 @@
+  AWSTemplateFormatVersion: '2010-09-09'
+  Description: SOA Stack - CloudFront distribution with S3 static website and
+    image storage bucket
+
+  Resources:
+    # S3 Bucket for static website hosting (b1)
+    StaticWebsiteBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: !Sub soa-param-codeland-s3-static-website-${AWS::AccountId}-${AWS::Region}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        VersioningConfiguration:
+          Status: Enabled
+        WebsiteConfiguration:
+          IndexDocument: index.html
+          ErrorDocument: index.html
+        Tags:
+          - Key: Name
+            Value: soa-param-codeland-s3-static-website
+          - Key: Environment
+            Value: Develop
+          - Key: SystemID
+            Value: SOA
+
+    # S3 Bucket for image storage (b2) 
+    ImageStorageBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: !Sub soa-param-codeland-s3-image-storage-${AWS::AccountId}-${AWS::Region}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        BucketEncryption:
+          ServerSideEncryptionConfiguration:
+            - ServerSideEncryptionByDefault:
+                SSEAlgorithm: AES256
+        VersioningConfiguration:
+          Status: Enabled
+        Tags:
+          - Key: Name
+            Value: soa-param-codeland-s3-image-storage
+          - Key: Environment
+            Value: Develop
+          - Key: SystemID
+            Value: SOA
+
+    # Origin Access Control for CloudFront
+    OriginAccessControl:
+      Type: AWS::CloudFront::OriginAccessControl
+      Properties:
+        OriginAccessControlConfig:
+          Name: soa-param-codeland-cloudfront-oac-s3
+          OriginAccessControlOriginType: s3
+          SigningBehavior: always
+          SigningProtocol: sigv4
+          Description: OAC for SOA static website bucket
+
+    # CloudFront Distribution (cf1)
+    CloudFrontDistribution:
+      Type: AWS::CloudFront::Distribution
+      Properties:
+        DistributionConfig:
+          Comment: SOA CloudFront Distribution for static website
+          Enabled: true
+          DefaultRootObject: index.html
+          Origins:
+            - Id: soa-s3-origin
+              DomainName: !GetAtt StaticWebsiteBucket.RegionalDomainName
+              S3OriginConfig: {}
+              OriginAccessControlId: !GetAtt OriginAccessControl.Id
+          DefaultCacheBehavior:
+            TargetOriginId: soa-s3-origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods:
+              - GET
+              - HEAD
+              - OPTIONS
+            CachedMethods:
+              - GET
+              - HEAD
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed CachingOptimized
+          PriceClass: PriceClass_100
+          ViewerCertificate:
+            CloudFrontDefaultCertificate: true
+        Tags:
+          - Key: Name
+            Value: soa-param-codeland-cloudfront-distribution
+          - Key: Environment
+            Value: Develop
+          - Key: SystemID
+            Value: SOA
+
+    # Bucket Policy for static website bucket - only allows CloudFront access
+    StaticWebsiteBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      DependsOn: CloudFrontDistribution
+      Properties:
+        Bucket: !Ref StaticWebsiteBucket
+        PolicyDocument:
+          Statement:
+            - Sid: AllowCloudFrontServicePrincipal
+              Effect: Allow
+              Principal:
+                Service: cloudfront.amazonaws.com
+              Action:
+                - s3:GetObject
+              Resource: !Sub 'arn:aws:s3:::${StaticWebsiteBucket}/*'
+              Condition:
+                StringEquals:
+                  AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+    # IAM Role for EC2 instances with SSM and S3 permissions
+    EC2S3AccessRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: soa-param-codeland-ec2-s3-access-role
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: ec2.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+          - arn:aws:iam::aws:policy/AmazonSSMManagedEC2InstanceDefaultPolicy
+        Policies:
+          - PolicyName: SOACustomPermissions
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                # SSM Parameters access
+                - Effect: Allow
+                  Action:
+                    - ssm:GetParameter
+                    - ssm:GetParameters
+                    - ssm:GetParameterHistory
+                  Resource: '*'
+                # Secrets Manager access  
+                - Effect: Allow
+                  Action:
+                    - secretsmanager:GetSecretValue
+                  Resource: '*'
+                # CloudWatch Logs permissions
+                - Effect: Allow
+                  Action:
+                    - logs:CreateLogGroup
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: '*'
+                # S3 Full Access
+                - Effect: Allow
+                  Action:
+                    - s3:*
+                    - s3-object-lambda:*
+                  Resource: '*'
+        Tags:
+          - Key: Name
+            Value: soa-param-codeland-ec2-s3-access-role
+          - Key: Environment
+            Value: Develop
+          - Key: SystemID
+            Value: SOA
+
+    # Instance Profile for EC2 
+    EC2InstanceProfile:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+        InstanceProfileName: soa-param-codeland-ec2-instance-profile
+        Roles:
+          - !Ref EC2S3AccessRole
+
+    # Bucket Policy for image storage - only allows EC2 instances with specific role
+    ImageStorageBucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      DependsOn: 
+        - ImageStorageBucket
+        - EC2S3AccessRole
+      Properties:
+        Bucket: !Ref ImageStorageBucket
+        PolicyDocument:
+          Statement:
+            - Sid: AllowEC2RoleAccess
+              Effect: Allow
+              Principal:
+                AWS: !GetAtt EC2S3AccessRole.Arn
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub 'arn:aws:s3:::${ImageStorageBucket}/*'
+            - Sid: AllowEC2RoleListBucket
+              Effect: Allow
+              Principal:
+                AWS: !GetAtt EC2S3AccessRole.Arn
+              Action: s3:ListBucket
+              Resource: !GetAtt ImageStorageBucket.Arn
+
+    # SSM Parameter to store bucket name
+    S3BucketNameParameter:
+      Type: AWS::SSM::Parameter
+      Properties:
+        Name: soa-param-codeland-static-bucket-name
+        Description: S3 bucket name for static website hosting environment
+        Type: String
+        Value: !Ref ImageStorageBucket
+        Tier: Standard
+        DataType: text
+        Tags:
+          Name: soa-param-codeland-static-bucket-name
+          Environment: Develop
+          SystemID: SOA
+
+  Outputs:
+    CloudFrontDistributionId:
+      Description: CloudFront Distribution ID
+      Value: !Ref CloudFrontDistribution
+      Export:
+        Name: !Sub ${AWS::StackName}-CloudFrontDistributionId
+
+    CloudFrontDomainName:
+      Description: CloudFront Distribution Domain Name
+      Value: !GetAtt CloudFrontDistribution.DomainName
+      Export:
+        Name: !Sub ${AWS::StackName}-CloudFrontDomainName
+
+    StaticWebsiteBucketName:
+      Description: Static Website S3 Bucket Name
+      Value: !Ref StaticWebsiteBucket
+      Export:
+        Name: !Sub ${AWS::StackName}-StaticWebsiteBucketName
+
+    ImageStorageBucketName:
+      Description: Image Storage S3 Bucket Name
+      Value: !Ref ImageStorageBucket
+      Export:
+        Name: !Sub ${AWS::StackName}-ImageStorageBucketName
+
+    EC2InstanceProfileArn:
+      Description: EC2 Instance Profile ARN for S3 access
+      Value: !GetAtt EC2InstanceProfile.Arn
+      Export:
+        Name: !Sub ${AWS::StackName}-EC2InstanceProfileArn

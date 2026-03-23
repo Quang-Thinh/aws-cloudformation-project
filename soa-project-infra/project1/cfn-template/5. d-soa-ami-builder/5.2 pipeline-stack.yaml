@@ -1,0 +1,685 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Image Builder Pipeline with Step Functions'
+
+Parameters:
+  
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: 'VPC ID for building AMI'
+  
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: 'Subnet ID for building'
+  
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: 'Security Group ID for builder instance'
+  
+  GitRepositoryUrl:
+    Type: String
+    Default: 'https://github.com/cloud-mentor-pro/soa-project-backend'
+    Description: 'GitHub repository URL'
+  
+  GitBranchName:
+    Type: String
+    Default: 'develop-SOA-K02 '
+    Description: 'Git branch name to checkout'
+
+
+Resources:
+  # ==========================================
+  # Lambda Functions
+  # ==========================================
+  InitializeMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-InitMonitor'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: 
+        Fn::ImportValue: !Sub 'd-soa-ami-builder-iam-LambdaRoleArn'
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3, json, logging, time
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          imagebuilder = boto3.client('imagebuilder')
+          def handler(event, context):
+              try:
+                  pipeline_arn = event['pipelineArn']
+                  cf_event = event['cloudFormationEvent']
+                  logger.info(f"Starting pipeline: {pipeline_arn}")
+                  response = imagebuilder.start_image_pipeline_execution(imagePipelineArn=pipeline_arn)
+                  build_version_arn = response['imageBuildVersionArn']
+                  logger.info(f"Started: {build_version_arn}")
+                  return {
+                      'pipelineArn': pipeline_arn,
+                      'buildVersionArn': build_version_arn,
+                      'status': 'BUILDING',
+                      'pollCount': 0,
+                      'cloudFormationEvent': cf_event,
+                      'startTime': int(time.time())
+                  }
+              except Exception as e:
+                  logger.error(f"Failed: {str(e)}")
+                  raise Exception(f"Pipeline start failed: {str(e)}")
+
+  CheckStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-CheckStatus'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: 
+        Fn::ImportValue: !Sub 'd-soa-ami-builder-iam-LambdaRoleArn'
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3, json, logging, time
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          imagebuilder = boto3.client('imagebuilder')
+          def handler(event, context):
+              try:
+                  pipeline_arn = event['pipelineArn']
+                  build_version_arn = event.get('buildVersionArn')
+                  poll_count = event.get('pollCount', 0)
+                  start_time = event.get('startTime', int(time.time()))
+                  logger.info(f"Checking: {build_version_arn}, Poll: {poll_count}")
+                  result = {
+                      'pipelineArn': pipeline_arn,
+                      'buildVersionArn': build_version_arn,
+                      'status': 'PENDING',
+                      'pollCount': poll_count,
+                      'cloudFormationEvent': event['cloudFormationEvent'],
+                      'startTime': start_time
+                  }
+                  if build_version_arn:
+                      response = imagebuilder.get_image(imageBuildVersionArn=build_version_arn)
+                      image = response.get('image', {})
+                      state = image.get('state', {}).get('status', 'PENDING')
+                      logger.info(f"Status: {state}, Elapsed: {int(time.time() - start_time)}s")
+                      result['status'] = state
+                      if state == 'AVAILABLE':
+                          output_resources = image.get('outputResources', {})
+                          amis = output_resources.get('amis', [])
+                          if amis:
+                              result['amiId'] = amis[0].get('image')
+                              result['amiRegion'] = amis[0].get('region')
+                              result['buildVersion'] = image.get('version')
+                              result['buildTime'] = int(time.time() - start_time)
+                              logger.info(f"COMPLETE: {result['amiId']}")
+                      elif state in ['FAILED', 'CANCELLED']:
+                          reason = image.get('state', {}).get('reason', 'Unknown error')
+                          result['error'] = f'Build failed with state: {state}'
+                          result['reason'] = reason
+                          logger.error(f"FAILED: {reason}")
+                  return result
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  raise Exception(f"Status check failed: {str(e)}")
+
+  NotifyCloudFormationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-NotifyCF'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: 
+        Fn::ImportValue: !Sub 'd-soa-ami-builder-iam-LambdaRoleArn'
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3, json, logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def handler(event, context):
+              try:
+                  status = event['status']
+                  build_result = event['buildResult']
+                  cf_event = event['cloudFormationEvent']
+                  if status == 'SUCCESS':
+                      logger.info(f"SUCCESS! AMI: {build_result.get('amiId', 'N/A')}")
+                      cfnresponse.send(cf_event, context, cfnresponse.SUCCESS, {
+                          'Status': 'BUILD_COMPLETE',
+                          'AMIId': build_result.get('amiId', 'N/A'),
+                          'BuildVersion': build_result.get('buildVersion', 'N/A'),
+                          'State': build_result.get('status', 'AVAILABLE'),
+                          'BuildTime': f"{build_result.get('buildTime', 0)} seconds"
+                      }, build_result.get('amiId', 'unknown'))
+                  else:
+                      logger.error(f"FAILED: {build_result.get('error', 'Unknown')}")
+                      cfnresponse.send(cf_event, context, cfnresponse.FAILED, {
+                          'Status': 'BUILD_FAILED',
+                          'Error': build_result.get('error', 'Unknown error'),
+                          'Reason': build_result.get('reason', 'Unknown reason')
+                      })
+              except Exception as e:
+                  logger.error(f"Notification error: {str(e)}")
+                  cfnresponse.send(cf_event, context, cfnresponse.FAILED, {
+                      'Status': 'NOTIFICATION_FAILED',
+                      'Error': str(e)
+                  })
+
+  # ==========================================
+  # Step Function
+  # ==========================================
+  AMIBuildStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn:
+      - InitializeMonitorFunction
+      - CheckStatusFunction
+      - NotifyCloudFormationFunction
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-AMI-Monitor'
+      RoleArn: 
+        Fn::ImportValue: !Sub 'd-soa-ami-builder-iam-StepFunctionRoleArn'
+      DefinitionString: !Sub |
+        {
+          "StartAt": "InitializeMonitoring",
+          "States": {
+            "InitializeMonitoring": {
+              "Type": "Task",
+              "Resource": "${InitializeMonitorFunction.Arn}",
+              "Next": "WaitForInitialization"
+            },
+            "WaitForInitialization": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "CheckBuildStatus"
+            },
+            "CheckBuildStatus": {
+              "Type": "Task",
+              "Resource": "${CheckStatusFunction.Arn}",
+              "Next": "EvaluateStatus"
+            },
+            "EvaluateStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.status",
+                  "StringEquals": "AVAILABLE",
+                  "Next": "NotifySuccess"
+                },
+                {
+                  "Or": [
+                    {"Variable": "$.status", "StringEquals": "FAILED"},
+                    {"Variable": "$.status", "StringEquals": "CANCELLED"}
+                  ],
+                  "Next": "NotifyFailure"
+                },
+                {
+                  "Variable": "$.pollCount",
+                  "NumericGreaterThan": 120,
+                  "Next": "TimeoutFailure"
+                }
+              ],
+              "Default": "WaitBeforeNextCheck"
+            },
+            "WaitBeforeNextCheck": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "IncrementCounter"
+            },
+            "IncrementCounter": {
+              "Type": "Pass",
+              "Parameters": {
+                "pipelineArn.$": "$.pipelineArn",
+                "buildVersionArn.$": "$.buildVersionArn",
+                "status.$": "$.status",
+                "pollCount.$": "States.MathAdd($.pollCount, 1)",
+                "cloudFormationEvent.$": "$.cloudFormationEvent",
+                "startTime.$": "$.startTime"
+              },
+              "Next": "CheckBuildStatus"
+            },
+            "NotifySuccess": {
+              "Type": "Task",
+              "Resource": "${NotifyCloudFormationFunction.Arn}",
+              "Parameters": {
+                "status": "SUCCESS",
+                "buildResult.$": "$",
+                "cloudFormationEvent.$": "$.cloudFormationEvent"
+              },
+              "End": true
+            },
+            "NotifyFailure": {
+              "Type": "Task",
+              "Resource": "${NotifyCloudFormationFunction.Arn}",
+              "Parameters": {
+                "status": "FAILED",
+                "buildResult.$": "$",
+                "cloudFormationEvent.$": "$.cloudFormationEvent"
+              },
+              "End": true
+            },
+            "TimeoutFailure": {
+              "Type": "Task",
+              "Resource": "${NotifyCloudFormationFunction.Arn}",
+              "Parameters": {
+                "status": "FAILED",
+                "buildResult": {
+                  "error": "Build timeout",
+                  "reason": "AMI build did not complete within time limit"
+                },
+                "cloudFormationEvent.$": "$.cloudFormationEvent"
+              },
+              "End": true
+            }
+          }
+        }
+
+  # ==========================================
+  # Rest of Image Builder resources...
+  # ==========================================
+  ApplicationBuildComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Sub '${AWS::StackName}-build-component'
+      Version: '1.0.0'
+      Platform: Linux
+      Description: 'Component to install Python application'
+      SupportedOsVersions:
+        - 'Amazon Linux 2023'
+      Data: !Sub |
+        name: ApplicationSetupComponent
+        description: Install and configure Python application with Gunicorn and CloudFormation integration
+        schemaVersion: 1.0
+
+        constants:
+          - AppDir:
+              type: string
+              value: /root/app
+          - ServiceName:
+              type: string
+              value: codeland-backend
+
+        phases:
+          - name: build
+            steps:
+              # Step 1: Update system and install base packages
+              - name: UpdateAndInstallBase
+                action: ExecuteBash
+                onFailure: Abort
+                inputs:
+                  commands:
+                    - |
+                      echo "===== Step 1: Update system and install basic packages ====="
+                      cd ~
+                      echo $(whoami)
+
+                      sudo dnf update -y
+                      
+                      # Install necessary packages including AWS CLI
+                      sudo dnf install -y nmap-ncat gcc gcc-c++ make postgresql-devel python3-devel 
+                      
+                      # Install cloud watch agent
+                      sudo dnf -y install amazon-cloudwatch-agent
+
+                      # update cfn packages
+                      sudo yum update -y aws-cfn-bootstrap
+
+                      # check AWS CLI 
+                      if command -v aws >/dev/null 2>&1; then
+                          aws --version
+                      elif [ -f "/usr/bin/aws" ]; then
+                          /usr/bin/aws --version
+                      elif [ -f "/usr/local/bin/aws" ]; then
+                          /usr/local/bin/aws --version
+                      else
+                          echo "Installing AWS CLI v2..."
+                          cd /tmp
+                          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                          unzip awscliv2.zip
+                          sudo ./aws/install
+                          /usr/local/bin/aws --version
+                          aws --version
+                      fi
+                      
+                      echo "Installed basic packages"
+              
+              # Step 2: Install Git
+              - name: InstallGit
+                action: ExecuteBash
+                onFailure: Abort
+                inputs:
+                  commands:
+                    - |
+                      echo "===== Step 2: Install Git ====="
+                      sudo dnf install -y git
+                      git --version
+                      echo "Git has been installed"
+
+              # # Step 3: Install Python 3.12
+              # - name: InstallPython312
+              #   action: ExecuteBash
+              #   onFailure: Abort
+              #   inputs:
+              #     commands:
+              #       - |
+              #         echo "===== Step 3: Install Python 3.12 ====="
+              #         sudo dnf install -y python3.12 python3.12-pip python3.12-devel
+              #         sudo alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+              #         sudo alternatives --set python3 /usr/bin/python3.12
+              #         sudo ln -sf /usr/bin/pip3.12 /usr/bin/pip3
+                      
+              #         python3 --version
+              #         pip3 --version
+              #         echo "Python 3.12 has been installed"
+              
+              # Step 4: Clone repository and checkout branch
+              - name: CloneRepository
+                action: ExecuteBash
+                onFailure: Abort
+                inputs:
+                  commands:
+                    - |
+                      echo "===== Step 4: Clone source code from GitHub ====="
+                      cd ~
+                      
+                      [ -d "{{ AppDir }}" ] && sudo rm -rf {{ AppDir }}
+                      
+                      cd ~
+                      echo "Cloning repository: ${GitRepositoryUrl}"
+                      git clone ${GitRepositoryUrl} app
+                      
+                      cd {{ AppDir }}
+                      echo "Checking out branch: ${GitBranchName}"
+                      git checkout ${GitBranchName}
+                      git pull origin ${GitBranchName}
+                      
+                      echo "Current branch:"
+                      git branch --show-current
+                      echo "Latest commit:"
+                      git log --oneline -1
+                      
+                      sudo chown -R $USER:$USER {{ AppDir }}
+                      
+                      echo "Cloned repository and checked out branch ${GitBranchName}"
+                      ls -la {{ AppDir }}
+              
+              # Step 5: Install Python dependencies
+              - name: InstallPythonDependencies
+                action: ExecuteBash
+                onFailure: Abort
+                inputs:
+                  commands:
+                    - |
+                      echo "===== Step 5: Install Python dependencies ====="
+                      
+                      # Create virtual environment for application
+                      python3 -m venv /root/app/venv
+                      source /root/app/venv/bin/activate
+
+                      cd {{ AppDir }}/backend
+                      pip3 install --upgrade pip
+                      pip3 install gunicorn
+                      
+                      if [ -f requirements.txt ]; then
+                        pip3 install -r requirements.txt
+                        echo "Installed requirements.txt"
+                      else
+                        echo "requirements.txt not found"
+                      fi
+                      
+                      pip3 show gunicorn
+                      cd /root/app
+                      chmod +x ./scripts/start.sh
+              
+              # NEW Step 6: Create log directories for Gunicorn
+              - name: CreateGunicornLogDirs
+                action: ExecuteBash
+                onFailure: Abort
+                inputs:
+                  commands:
+                    - |
+                      echo "===== Step 6: Create Gunicorn log directories ====="
+                      sudo mkdir -p /var/log/gunicorn
+                      sudo chown root:root /var/log/gunicorn
+                      echo "Log directories created"
+              
+              # NEW Step 7: Create CloudWatch Agent configuration file
+              - name: CreateCWAgentConfig
+                action: CreateFile
+                onFailure: Abort
+                inputs:
+                  - path: /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+                    permissions: 644
+                    owner: root
+                    group: root
+                    content: |
+                      {
+                        "logs": {
+                          "logs_collected": {
+                            "files": {
+                              "collect_list": [
+                                {
+                                  "file_path": "/var/log/gunicorn/gunicorn_error.log",
+                                  "log_group_name": "/aws/ec2/{{ ServiceName }}-error",
+                                  "log_stream_name": "{instance_id}",
+                                  "timezone": "UTC"
+                                },
+                                {
+                                  "file_path": "/var/log/gunicorn/gunicorn_access.log",
+                                  "log_group_name": "/aws/ec2/{{ ServiceName }}-access",
+                                  "log_stream_name": "{instance_id}",
+                                  "timezone": "UTC"
+                                }
+                              ]
+                            }
+                          }
+                        }
+                      }
+              
+              # Step 8: Create systemd service (unchanged)
+              - name: CreateSystemdService
+                action: CreateFile
+                onFailure: Abort
+                inputs:
+                  - path: /etc/systemd/system/{{ ServiceName }}.service
+                    permissions: 644
+                    owner: root
+                    group: root
+                    content: |
+                      [Unit]
+                      Description=Codeland backend Python Application with Gunicorn
+                      After=network.target
+                      
+                      [Service]
+                      Type=simple
+                      User=root
+                      Group=root
+                      WorkingDirectory={{ AppDir }}
+                      Environment="PATH=/usr/local/bin:/usr/bin:/bin"
+                      Environment="LANG=en_US.UTF-8"
+                      ExecStart={{ AppDir }}/scripts/start.sh prod
+                      Restart=always
+                      RestartSec=10
+                      StandardOutput=journal
+                      StandardError=journal
+                      SyslogIdentifier={{ ServiceName }}
+                      
+                      [Install]
+                      WantedBy=multi-user.target
+              
+              # NEW Step 9: Configure and enable CloudWatch Agent
+              - name: ConfigureCWAgent
+                action: ExecuteBash
+                onFailure: Abort
+                inputs:
+                  commands:
+                    - |
+                      echo "===== Step 9: Configure and enable CloudWatch Agent ====="
+                      sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+                      sudo systemctl enable amazon-cloudwatch-agent.service
+                      echo "CloudWatch Agent configured and enabled"
+              
+              # Step 10: Enable service (unchanged)
+              - name: EnableService
+                action: ExecuteBash
+                onFailure: Abort
+                inputs:
+                  commands:
+                    - |
+                      echo "===== Step 10: Enable systemd service ====="
+                      sudo systemctl daemon-reload
+                      sudo systemctl enable {{ ServiceName }}.service
+                      echo "Service has been enabled for automatic startup"
+
+              - name: ValidateSetup
+                action: ExecuteBash
+                onFailure: Abort
+                inputs:
+                  commands:
+                    - |
+                      echo "===== Validation Phase ====="
+                      
+                      cd {{ AppDir }}
+                      
+                      # Switch env
+                      source /root/app/venv/bin/activate
+                      
+                      # Validate installed components
+                      python3 --version || { echo "Python not found"; exit 1; }
+                      git --version || { echo "Git not found"; exit 1; }
+                      pip3 show gunicorn || { echo "gunicorn not found"; exit 1; }
+                      
+                      # Validate files and directories
+                      [ -d "{{ AppDir }}" ] || { echo "App directory not found"; exit 1; }
+                      [ -f "{{ AppDir }}/scripts/start.sh" ] || { echo "Start script not found"; exit 1; }
+                      [ -f "/etc/systemd/system/{{ ServiceName }}.service" ] || { echo "Service file not found"; exit 1; }
+                      
+                      # Validate CloudWatch Agent - check if service is configured properly
+                      [ -d "/var/log/gunicorn" ] || { echo "Gunicorn log directory not found"; exit 1; }
+                      
+                      # Check if CloudWatch Agent service is enabled (this is more reliable)
+                      sudo systemctl is-enabled amazon-cloudwatch-agent.service >/dev/null 2>&1 || { echo "CW Agent service not enabled"; exit 1; }
+                      
+                      # Check if CloudWatch Agent binary exists
+                      [ -f "/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl" ] || { echo "CW Agent not installed"; exit 1; }
+                      
+                      # Validate service configuration
+                      sudo systemctl is-enabled {{ ServiceName }}.service || { echo "Service not enabled"; exit 1; }
+                      
+                      # Validate script permissions
+                      [ -x "{{ AppDir }}/scripts/start.sh" ] || { echo "Start script not executable"; exit 1; }
+                      
+                      echo "All validation checks have passed"
+
+  InfrastructureConfig:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Sub '${AWS::StackName}-infra-config'
+      Description: 'Infrastructure configuration'
+      InstanceProfileName: 
+        Fn::ImportValue: !Sub 'd-soa-ami-builder-iam-InstanceProfileName'
+      InstanceTypes:
+        - t3.micro
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      TerminateInstanceOnFailure: true
+
+  AppImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Sub '${AWS::StackName}-recipe'
+      Version: '1.0.0'
+      Description: 'Recipe for Python application'
+      ParentImage: !Sub 'arn:aws:imagebuilder:${AWS::Region}:aws:image/amazon-linux-2023-x86/x.x.x'
+      Components:
+        - ComponentArn: !Ref ApplicationBuildComponent
+      BlockDeviceMappings:
+        - DeviceName: '/dev/xvda'
+          Ebs:
+            VolumeSize: 20
+            VolumeType: 'gp3'
+            DeleteOnTermination: true
+            Encrypted: true
+
+  DistributionConfig:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Sub '${AWS::StackName}-distribution'
+      Description: 'Distribution configuration'
+      Distributions:
+        - Region: !Ref AWS::Region
+          AmiDistributionConfiguration:
+            Name: !Sub '${AWS::StackName}-AMI-{{imagebuilder:buildDate}}'
+            Description: 'Python application AMI'
+            AmiTags:
+              Name: !Sub '${AWS::StackName}-AMI'
+              Environment: 'SOA'
+
+  ImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Sub '${AWS::StackName}-pipeline'
+      Description: 'Pipeline to build Python application AMI'
+      ImageRecipeArn: !Ref AppImageRecipe
+      InfrastructureConfigurationArn: !Ref InfrastructureConfig
+      DistributionConfigurationArn: !Ref DistributionConfig
+      Status: ENABLED
+      ImageTestsConfiguration:
+        ImageTestsEnabled: false
+        TimeoutMinutes: 60
+
+  AMIBuilderFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - ImagePipeline
+      - AMIBuildStateMachine
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-AMIBuilder'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: 
+        Fn::ImportValue: !Sub 'd-soa-ami-builder-iam-LambdaRoleArn'
+      Timeout: 300
+      Code:
+        ZipFile: !Sub |
+          import cfnresponse
+          import boto3, json, logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          stepfunctions = boto3.client('stepfunctions')
+          def handler(event, context):
+              try:
+                  request_type = event['RequestType']
+                  if request_type == 'Create' or request_type == 'Update':
+                      pipeline_arn = event['ResourceProperties']['PipelineArn']
+                      execution_name = f"AMI-Monitor-{context.aws_request_id}"
+                      stepfunctions.start_execution(
+                          stateMachineArn='${AMIBuildStateMachine}',
+                          name=execution_name,
+                          input=json.dumps({
+                              'pipelineArn': pipeline_arn,
+                              'cloudFormationEvent': event
+                          })
+                      )
+                      logger.info(f"Started: {execution_name}")
+                  elif request_type == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Status': 'DELETE_COMPLETE'})
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  AMIBuilder:
+    Type: Custom::AMIBuilder
+    DependsOn:
+      - ImagePipeline
+      - AMIBuilderFunction
+    Properties:
+      ServiceToken: !GetAtt AMIBuilderFunction.Arn
+      PipelineArn: !GetAtt ImagePipeline.Arn
+
+Outputs:
+  PipelineArn:
+    Description: 'ARN of Image Pipeline'
+    Value: !GetAtt ImagePipeline.Arn
+  
+  AMIId:
+    Description: 'ID of successfully built AMI'
+    Value: !GetAtt AMIBuilder.AMIId

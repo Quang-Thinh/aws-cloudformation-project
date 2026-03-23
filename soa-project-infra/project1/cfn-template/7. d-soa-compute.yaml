@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for SOA Compute Resources - Launch Template, ASG, ALB with WaitCondition'
+
+Parameters:
+  # Networking Parameters
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select VPC for resources 
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select Public Subnet 1 
+
+  PublicSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select Public Subnet 2 
+
+  PrivateAppSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select Private App Subnet 1 
+
+  PrivateAppSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select Private App Subnet 2 
+
+  # Security Groups Parameters
+  ALBSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Select ALB Security Group 
+
+  AppSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Select App Security Group 
+
+  # Service Configuration
+  ServiceName:
+    Type: String
+    Description: Service name
+    Default: codeland-api
+
+  AMIId:
+    Type: AWS::EC2::Image::Id
+    Description: Select AMI from existing AMIs in your account 
+
+  InstanceType:
+    Type: String
+    Description: EC2 instance type for Launch Template
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t2.micro
+      - t2.small
+      - t2.medium
+
+Resources:
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'soa-lt-codeland-${ServiceName}'
+      LaunchTemplateData:
+        ImageId: !Ref AMIId
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !Ref AppSecurityGroupId
+        UserData:
+          Fn::Base64: !Sub |         
+            # Install your application here
+            # Example: Start your codeland-api service
+            # systemctl start codeland-api
+            # systemctl enable codeland-api
+            
+            # Wait for application to be ready (optional health check)
+            # while ! curl -f http://localhost:80/users/ping; do
+            #   echo "Waiting for application to start..."
+            #   sleep 5
+            # done
+            
+            # Signal CloudFormation that instance is ready
+            /opt/aws/bin/cfn-signal -e $? \
+              --stack ${AWS::StackName} \
+              --resource AutoScalingGroup \
+              --region ${AWS::Region}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub 'soa-ec2-codeland-${ServiceName}'
+              - Key: Environment
+                Value: develop
+              - Key: SystemID
+                Value: SOA
+
+  # Target Group
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'soa-tg-codeland-${ServiceName}'
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /users/ping
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Port: 80
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: !Ref VPCId
+      Tags:
+        - Key: Name
+          Value: !Sub 'soa-tg-codeland-${ServiceName}'
+        - Key: Environment
+          Value: develop
+        - Key: SystemID
+          Value: SOA
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub 'soa-alb-codeland-${ServiceName}'
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroupId
+      Subnets:
+        - !Ref PublicSubnet1Id
+        - !Ref PublicSubnet2Id
+      Type: application
+      Tags:
+        - Key: Name
+          Value: !Sub 'soa-alb-codeland-${ServiceName}'
+        - Key: Environment
+          Value: develop
+        - Key: SystemID
+          Value: SOA
+
+  # HTTP Listener
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # Auto Scaling Group với CreationPolicy
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: 
+      - HTTPListener
+    Properties:
+      AutoScalingGroupName: !Sub 'soa-asg-codeland-${ServiceName}'
+      MinSize: '1'
+      MaxSize: '2'
+      DesiredCapacity: '1'
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref PrivateAppSubnet1Id
+        - !Ref PrivateAppSubnet2Id
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      Tags:
+        - Key: Name
+          Value: !Sub 'soa-ec2-codeland-${ServiceName}'
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: develop
+          PropagateAtLaunch: true
+        - Key: SystemID
+          Value: SOA
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1                
+        Timeout: PT10M          
+
+Outputs:
+  ALBDnsName:
+    Description: ALB DNS Name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-ALBDnsName"
+
+  AutoScalingGroupName:
+    Description: Auto Scaling Group Name
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-AutoScalingGroupName"
+
+  LaunchTemplateId:
+    Description: Launch Template ID
+    Value: !Ref LaunchTemplate
+    Export:
+      Name: !Sub "${AWS::StackName}-LaunchTemplateId"
+
+  TargetGroupArn:
+    Description: Target Group ARN
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-TargetGroupArn"

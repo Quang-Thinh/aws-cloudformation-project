@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IAM Roles and Instance Profiles for Image Builder Pipeline'
+
+Parameters:
+  
+  DBUrlParameterPath:
+    Type: String
+    Default: 'soa-param-codeland-db-url'
+    Description: 'SSM Parameter Store path for DB URL'
+  
+  DBPasswordSecretId:
+    Type: String
+    Default: 'rds!zzz'
+    Description: 'Secrets Manager secret ID for DB Password'
+
+Resources:
+  # ==========================================
+  # IAM Role and Instance Profile for Image Builder
+  # ==========================================
+  ImageBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ImageBuilder-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilderECRContainerBuilds 
+      Policies:
+        - PolicyName: ImageBuilderPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - imagebuilder:GetComponent
+                  - imagebuilder:GetImage
+                  - imagebuilder:GetImageRecipe
+                  - imagebuilder:GetInfrastructureConfiguration
+                  - imagebuilder:GetDistributionConfiguration
+                  - imagebuilder:ListComponents
+                  - imagebuilder:ListImageBuildVersions
+                  - imagebuilder:ListImages
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParameterHistory
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${DBUrlParameterPath}'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${DBPasswordSecretId}*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-ImageBuilderRole'
+        - Key: Environment
+          Value: 'SOA'
+
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    DependsOn: ImageBuilderRole
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-ImageBuilder-Profile'
+      Roles:
+        - !Ref ImageBuilderRole
+
+  # ==========================================
+  # Lambda Role for Step Functions
+  # ==========================================
+  AMIBuilderLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-AMIBuilder-Lambda-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ImageBuilderAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - imagebuilder:StartImagePipelineExecution
+                  - imagebuilder:GetImagePipeline
+                  - imagebuilder:ListImagePipelineImages
+                  - imagebuilder:GetImage
+                  - imagebuilder:CancelImageCreation
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeImages
+                  - ec2:DescribeImageAttribute
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:DescribeExecution
+                  - states:StopExecution
+                  - states:ListExecutions
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-LambdaRole'
+
+  # ==========================================
+  # Step Function Role
+  # ==========================================
+  StepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-StepFunction-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-StepFunctionRole'
+
+Outputs:
+  ImageBuilderRoleArn:
+    Description: 'ARN of Image Builder Role'
+    Value: !GetAtt ImageBuilderRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ImageBuilderRoleArn'
+  
+  InstanceProfileName:
+    Description: 'Name of Instance Profile'
+    Value: !Ref ImageBuilderInstanceProfile
+    Export:
+      Name: !Sub '${AWS::StackName}-InstanceProfileName'
+  
+  LambdaRoleArn:
+    Description: 'ARN of Lambda Role'
+    Value: !GetAtt AMIBuilderLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaRoleArn'
+  
+  StepFunctionRoleArn:
+    Description: 'ARN of Step Function Role'
+    Value: !GetAtt StepFunctionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-StepFunctionRoleArn'

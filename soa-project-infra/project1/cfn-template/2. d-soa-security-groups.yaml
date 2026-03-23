@@ -1,0 +1,145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for SOA Security Groups - Adapted for 1 VPC, 3-tier (Public/App/DB), 6 subnets, 1 ALB, 1 ASG EC2, 1 RDS DB'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the VPC for Security Groups
+
+Resources:
+  # Security Group for ALB (Public Tier)
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: soa-sg-codeland-alb
+      GroupDescription: Security Group for Application Load Balancer (Public Subnets)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP traffic from Internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS traffic from Internet
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: soa-sg-codeland-alb
+        - Key: Environment
+          Value: develop
+        - Key: SystemID
+          Value: SOA
+        - Key: Tier
+          Value: Public
+
+  # Security Group for EC2 ASG (App Tier - Private App Subnets)
+  EC2AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: soa-sg-codeland-ec2-app
+      GroupDescription: Security Group for EC2 ASG in App Tier
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow HTTP traffic from ALB
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic (e.g., to RDS, internet via NAT)
+      Tags:
+        - Key: Name
+          Value: soa-sg-codeland-ec2-app
+        - Key: Environment
+          Value: develop
+        - Key: SystemID
+          Value: SOA
+        - Key: Tier
+          Value: App
+
+  # Security Group for RDS (DB Tier - Private DB Subnets)
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: soa-sg-codeland-db
+      GroupDescription: Security Group for RDS Database (DB Tier)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref EC2AppSecurityGroup
+          Description: Allow PostgreSQL access from EC2 App Tier
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+          Description: Allow PostgreSQL access from Bastion (for admin)
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic (typically not needed for RDS)
+      Tags:
+        - Key: Name
+          Value: soa-sg-codeland-db
+        - Key: Environment
+          Value: develop
+        - Key: SystemID
+          Value: SOA
+        - Key: Tier
+          Value: DB
+
+  # Security Group for Bastion Host (Public Tier - for admin access)
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: soa-sg-codeland-bastion
+      GroupDescription: Security Group for Bastion Host (SSH access to App/DB)
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic (e.g., to App/DB tiers)
+      Tags:
+        - Key: Name
+          Value: soa-sg-codeland-bastion
+        - Key: Environment
+          Value: develop
+        - Key: SystemID
+          Value: SOA
+        - Key: Tier
+          Value: Public
+
+Outputs:
+  ALBSecurityGroupId:
+    Description: ALB Security Group ID (Public Tier)
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ALBSecurityGroupID"
+
+  EC2AppSecurityGroupId:
+    Description: EC2 ASG Security Group ID (App Tier)
+    Value: !Ref EC2AppSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-EC2AppSecurityGroupID"
+
+  RDSSecurityGroupId:
+    Description: RDS Security Group ID (DB Tier)
+    Value: !Ref RDSSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-RDSSecurityGroupID"
+
+  BastionSecurityGroupId:
+    Description: Bastion Security Group ID (Public Tier)
+    Value: !Ref BastionSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-BastionSecurityGroupID"
